@@ -1,0 +1,435 @@
+---
+title: "Untitled"
+author: "niko"
+date: "2024-03-21"
+output: pdf_document
+---
+
+```{r}
+library(DALEX)
+library(ipred)
+```
+
+
+```{r}
+library(sf)
+library(xgboost)
+library(caret)
+library(tmap)
+library(rpart.plot)
+library(dplyr)
+library(lme4)
+library(tidyverse)
+library(geotools)
+library(readr)
+#install.packages('mlr')
+#install.packages("parallelMap")
+#install.packages("vip")
+library(parallelMap)
+library(FNN)
+df <- read_csv("C:/Users/david/OneDrive/Desktop/DATA SCIENCE UU/geostat_machineLEanring/big assignment/df_10000.csv")
+df <- df |> drop_na(TRAFFICWAY_TYPE)
+df <- df |> drop_na(combined_score)
+df <- df[!(df$LONGITUDE == 0 | df$LATITUDE == 0),]
+```
+
+```{r}
+speed_camera_locations <- read.csv("C:/Users/david/OneDrive/Desktop/DATA SCIENCE UU/geostat_machineLEanring/big assignment/data/Map_-_Speed_Camera_Locations(1).csv")
+congestion <- read.csv("C:/Users/david/OneDrive/Desktop/DATA SCIENCE UU/geostat_machineLEanring/big assignment/congestion.csv")
+
+
+```
+
+
+
+
+```{r}
+
+
+crashes_geom = st_as_sf(df, coords=c("LONGITUDE", "LATITUDE"))
+camera_geom = st_as_sf(speed_camera_locations, coords=c("LONGITUDE", "LATITUDE"))
+
+tmap_mode("view")
+
+tm_shape(crashes_geom) + tm_dots()
+
+```
+
+
+```{r}
+form <- combined_score ~ TRAFFICWAY_TYPE + DEVICE_CONDITION+ dist_to_closest_light+ Time_Category+ centroid_dist+ ROADWAY_SURFACE_COND+ CRASH_DAY_OF_WEEK
+sparse_matrix <- sparse.model.matrix(form, data = crashes_geom[1:8000,])
+xg <- xgboost(data = sparse_matrix, label = crashes_geom[1:8000,]$combined_score, nrounds=100)
+crashes_geom$xg_y_hat <- predict(xg, sparse_matrix)
+
+m<-lm(formula=combined_score ~ Time_Category + TRAFFICWAY_TYPE + DEVICE_CONDITION + dist_to_closest_light, data=crashes_geom)
+#m<-lm(formula=combined_score ~ TRAFFICWAY_TYPE + DEVICE_CONDITION, data=out)
+
+summary(m)
+plot(m)
+```
+
+```{r}
+tmap_mode("view")
+
+tm_shape(crashes_geom) + tm_dots("norm_y")
+importance <- xgb.importance(feature_names = colnames(sparse_matrix), model = xg)
+predict(xg, sparse_matrix)
+head(importance)
+```
+
+
+
+```{r}
+mat <- xgb.importance(model = xg)
+xgb.plot.importance (importance_matrix = mat[1:20]) 
+normalize <- function(x, na.rm = TRUE) {
+    return((x- min(x)) /(max(x)-min(x)))
+}
+crashes_geom$norm_y <- normalize(crashes$xg_y_hat) 
+#crashes$pred_xg <- ifelse(crashes$norm_y > 0.5, 1, 0)
+#confusionMatrix (as.factor(crashes$pred_xg), crashes$crash_fac)
+summary(xg)
+```
+## distance to closest red light camera
+```{r}
+crashes_geom = st_as_sf(df, coords=c("LONGITUDE", "LATITUDE"))
+camera_geom = st_as_sf(speed_camera_locations, coords=c("LONGITUDE", "LATITUDE"))
+dist_matrix = st_distance(crashes_geom, camera_geom) #distance for each point to each point
+tr <- dist_matrix==apply(dist_matrix,1, min) #get min
+index_min <- which(tr == TRUE) %% nrow(camera_geom) + 1 #find min
+crashes_geom$CLOSEST_LIGHT <- camera_geom$geometry[index_min] #project min
+
+crashes_geom$dist_to_closest_light <- mapply(st_distance, crashes_geom$geometry, crashes_geom$CLOSEST_LIGHT)
+crashes_geom <- crashes_geom[crashes_geom$dist_to_closest_light < 50,]
+```
+
+
+
+
+```{r}
+#now we would write our own function to estimate distance using nearest neighbor algorithm
+#This function take an origin point (from), and a destination point (to), and then use nn function of FNN package to estimate the distance to the nearest (k =1) neighborhood location
+ nn_function <- function(measureFrom,measureTo,k) {
+    measureFrom_Matrix <- as.matrix(measureFrom)
+    measureTo_Matrix <- as.matrix(measureTo)
+    nn <-   
+      get.knnx(measureTo, measureFrom, k)$nn.dist [,k]
+    return(nn)
+  }
+```
+
+
+```{r}
+chicago_boundaries <- st_read("C:/Users/david/OneDrive/Desktop/DATA SCIENCE UU/geostat_machineLEanring/big assignment/chicago_boundaries.gpkg")    # Selecting only the "communities" and "geom" columns
+chicago_boundaries <- chicago_boundaries[, c("community", "geom")]         # Renaming the "communities" column to "id"
+names(chicago_boundaries)[names(chicago_boundaries) == "community"] <- "id" 
+district_cen <- st_centroid(chicago_boundaries)    
+district_cen <- district_cen |> drop_na(geom)     
+nn_function <- function(measureFrom,measureTo,k) {
+    measureFrom_Matrix <- as.matrix(measureFrom)
+    measureTo_Matrix <- as.matrix(measureTo)
+    nn <-   
+      get.knnx(measureTo, measureFrom, k)$nn.dist [,k]
+    return(nn)
+}     #replace df_clean w what you have df_clean <- df_clean %>%
+
+crashes_geom <- crashes_geom |> mutate(centroid_dist = nn_function(st_coordinates(crashes_geom$geometry), st_coordinates(district_cen$geom), k = 1))
+
+```
+
+
+## getting geom for roads
+```{r}
+cong_geom = st_as_sf(congestion, coords=c("START_LONGITUDE", "START_LATITUDE")) 
+data_sf <- st_as_sf(congestion, coords = c("END_LONGITUDE", "END_LATITUDE"))
+cong_geom$new_l <- st_geometry(data_sf)
+
+for (i in 1:nrow(cong_geom)){
+  result <- st_linestring(rbind(st_coordinates(cong_geom$geometry[i]), st_coordinates(data_sf$geometry[i])))
+  cong_geom$geometry[i] <- result
+}
+
+tmap_mode("view")
+
+tm_shape(cong_geom) + tm_lines()
+
+```
+##assigning closest crashes's attributes to each road in the dataset so we can predict
+```{r}
+dist_matrix2 <- st_distance(cong_geom, crashes_geom) # distance for each point to each point
+tr2 <- dist_matrix2 == apply(dist_matrix2, 1, min) # get min
+index_min2 <- vector()
+for (i in 1:nrow(cong_geom)) {
+  result <- which(tr2[i,] == TRUE)[1] %% nrow(cong_geom) + 1
+  index_min2 <- append(index_min2, result)
+}
+
+
+df_roads <- crashes_geom[index_min2,]
+st_geometry(df_roads) <- cong_geom$geometry
+sparse <- sparse.model.matrix(combined_score ~ TRAFFICWAY_TYPE + DEVICE_CONDITION + dist_to_closest_light, data = df_roads)
+
+
+tm_shape(df_roads) + tm_lines("y_hat")
+
+
+```
+
+
+```{r} 
+#dealing with NA
+# Count the number of NA values for each column in cr_hyp
+
+
+# Drop rows with NA values in 'combined_score' column using na.omit()
+cr_hyp <- na.omit(cr_hyp)
+na_count <- colSums(is.na(cr_hyp))
+print(na_count)
+```
+```{r}
+
+```
+
+
+```{r}
+cr_hyp <- crashes_geom
+#cr_hyp <- na.omit(cr_hyp)
+
+#split the data into a train/test split
+# Split data into training and testing sets
+set.seed(123)  # for reproducibility
+data_split <- rsample::initial_split(cr_hyp, strata = "combined_score", prop = 0.75) #where we are splitting the data at 75-25, and stratifying based on dependent variable 
+train.set_wtID <- rsample::training(data_split)
+test.set_wtID  <- rsample::testing(data_split)
+
+#declare the set explicit
+train.set <- train.set_wtID 
+test.set <- test.set_wtID
+
+cr_hyp <- train.set
+cr_hyp <- as.data.frame(unclass(cr_hyp),stringsAsFactors=TRUE)
+
+#TRAFFICWAY_TYPE, DEVICE_CONDITION, dist_to_closest_light
+#select(-c(CRASH_DATE, ))
+
+cr_hyp <- subset(cr_hyp, select=c(combined_score,TRAFFICWAY_TYPE, DEVICE_CONDITION, dist_to_closest_light, Time_Category, centroid_dist, ROADWAY_SURFACE_COND, CRASH_DAY_OF_WEEK))
+#cr_hyp <- subset(cr_hyp, select=-c(DATE_POLICE_NOTIFIED, STREET_NO, STREET_NAME, CRASH_RECORD_ID, CRASH_DATE,Time,geometry,geometry.1, injury_score, damage_score))
+task <- makeRegrTask(data = cr_hyp, target = "combined_score")
+tree <- makeLearner("regr.rpart")
+  
+treeParamSpace <- makeParamSet(
+  makeIntegerParam("minsplit", lower = 1, upper = 20),
+  makeIntegerParam("minbucket", lower = 1, upper = 10),
+  makeNumericParam("cp", lower = 0.001, upper = 0.1),
+  makeIntegerParam("maxdepth", lower = 3, upper = 100))
+
+randSearch <- makeTuneControlRandom(maxit = 200)
+cvForTuning <- makeResampleDesc("CV", iters = 5)
+
+parallelStartSocket(cpus = detectCores())
+
+tunedTreePars <- tuneParams(tree, task = task,
+                            resampling = cvForTuning,
+                            par.set = treeParamSpace,
+                            control = randSearch)
+
+parallelStop()
+
+tunedTreePars
+
+tunedTree <- setHyperPars(tree, par.vals = tunedTreePars$x)
+tunedTreeModel <- train(tunedTree, task)
+
+df_roads$y_hat <- predict(treeModelData, df_roads)
+```
+
+
+```{r}
+treeModelData <- getLearnerModel(tunedTreeModel)
+rpart.plot(treeModelData, roundint = FALSE,
+box.palette = "BuBn",
+type = 5)
+
+df <- data.frame(imp = treeModelData$variable.importance)
+df2 <- df %>% 
+  tibble::rownames_to_column() %>% 
+  dplyr::rename("variable" = rowname) %>% 
+  dplyr::arrange(imp) %>%
+  dplyr::mutate(variable = forcats::fct_inorder(variable))
+ggplot2::ggplot(df2) +
+  geom_col(aes(x = variable, y = imp),
+           col = "black", show.legend = F) +
+  coord_flip() +
+  scale_fill_grey() +
+  theme_bw()
+```
+
+```{r}
+# test
+#use the predict function to predict the mortality rate based on the trained model 
+
+pred_DT <- predict(object = treeModelData,
+                newdata = test.set)
+
+#check the RMSE value for the predicted set
+testRMSE <- RMSE (pred = pred_DT,
+   obs = test.set$combined_score)
+
+#print RMSE
+testRMSE
+
+crashRFtest <- test.set |> st_drop_geometry()
+
+pred_RF <- predict(crashesRF, crashRFtest)
+
+RFRMSE <- RMSE (pred = pred_RF$predictions,
+   obs = test.set$combined_score)
+
+#print RMSE
+RFRMSE
+
+
+```
+
+
+```{r}
+vip (tunedTreeModel, num_features = 15, aesthetics = list(fill = "green3"), include_type = T) 
+```
+
+```{r}
+#Possible TODO MODEL EXPLAINER USING DALEX
+```
+
+
+```{r}
+# DT WITH BAGGING
+DT_bag1 <- bagging(
+  formula = form, data= cr_hyp,
+  nbagg = 200,  #number of DTs
+  coob = TRUE, #saving out of bag error
+  control = rpart.control(minsplit = 2, cp = 0)
+)
+
+DT_bag1
+
+pred_bag <- predict(object = DT_bag1,
+                newdata = test.set)
+
+#check the RMSE value for the predicted set
+testbag <- RMSE (pred = pred_bag,
+   obs = test.set$combined_score)
+
+#print RMSE
+
+test_set_boost <- sparse.model.matrix(form, data = crashes_geom[-(1:8000),])
+spred_boost <- predict(xg, test_set_boost)
+
+#check the RMSE value for the predicted set
+testboost <- RMSE (pred = pred_boost,
+   obs = test.set$combined_score)
+testboost
+
+
+
+```
+
+```{r}
+explainer_Bag1 <- DALEX::explain(
+  model = DT_bag1,
+  data = cr_hyp,
+  y = as.integer (cr_hyp$combined_score),
+  label = "Bagging with 200 trees",
+  verbose = FALSE
+)
+```
+
+
+```{r}
+vip.5_Bag1 <- model_parts(explainer = explainer_Bag1, 
+                   loss_function = loss_root_mean_square,
+                               B = 5, #number of permutation.
+                            type = "difference") 
+```
+
+```{r}
+plot(vip.5_Bag1, max_vars = 10) +
+  ggtitle("Mean variable-importance over 5 permutations ", "") 
+```
+
+```{r}
+#Also plot pdp
+pdp_Bag1 <- model_profile(explainer = explainer_Bag1, variables = "dist_to_closest_light") 
+
+plot(pdp_Bag1, geom = "profiles") +  ggtitle("Partial-dependence profile for distance to traffic light for Bagging model") 
+
+```
+
+
+```{r}
+# lets try RF Model
+
+
+#We need an unique ID and coordinates for evaluating the spatial correlations
+crashes_geom$id <- 1:nrow(crashes_geom) #this is to give an unique ID to each row
+crashes_geom$x <- st_coordinates(crashes_geom)[, 1] #get the X coordinate of the point
+crashes_geom$y <- st_coordinates(crashes_geom)[, 2] #get the Y coordinate of the point
+
+
+#now convert the file into a SP object, as the gDistance function we are using from rgeos package can only work on SP object
+crashgeom_sp <- as_Spatial(crashes_geom)
+
+#calculate the distance matrix based on sp object
+#distance_matrix <- gDistance(greendatacen_sp, byid=TRUE) #this is no longer working!
+
+#Calculate the distance matrix based on sf object
+distance_matrix <- st_distance(crashes_geom, crashes_geom)
+class(distance_matrix) <- setdiff(class(distance_matrix), "units")
+distance_matrix <- as.data.frame(distance_matrix)
+names(distance_matrix) <- 1:ncol(distance_matrix)
+distance_matrix <- as.matrix(distance_matrix)
+
+
+#distance thresholds (same units as distance_matrix)
+distance.thresholds <- c(0, 100, 300, 500) #these thresholds indicates when we are considering spatial pattern how far we look for neighborhoods, in this case we are going up to 500 m
+
+#drop the geometry column from the main sf object so it does not cause issues with the spatialRF functions
+crashgeom_spdf <- crashes_geom %>% st_drop_geometry()
+
+
+#create a xy list for coordinates to plot local importance, if you want check details: https://blasbenito.github.io/spatialRF/
+xy <- train.setRF[, c("x", "y")]
+
+```
+
+
+
+```{r}
+# Spatial RF
+random.seed <- 123
+crashesRF <- spatialRF::rf_spatial(
+  data =crashgeom_spdf,
+  dependent.variable.name = "combined_score",
+  predictor.variable.names = c("TRAFFICWAY_TYPE", "DEVICE_CONDITION", "dist_to_closest_light", "Time_Category", "centroid_dist", "ROADWAY_SURFACE_COND", "CRASH_DAY_OF_WEEK"),
+  distance.matrix = distance_matrix,
+  distance.thresholds = 0, #here we selected zero as in non-spatial model we found at multiple thresholds they all show auto-correlation
+  method = "mem.moran.sequential", #default method, you can select other methods too such as mem.effect.recursive, check help for details
+  ranger.arguments = list( 
+    mtry = 3,
+    min.node.size = 5,
+    num.trees = 500
+  ),
+  verbose = FALSE,
+  seed = random.seed
+  )
+```
+
+```{r}
+
+
+
+#print the model result
+crashesRF
+
+```
+
