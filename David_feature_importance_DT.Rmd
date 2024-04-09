@@ -53,6 +53,8 @@ tmap_mode("view")
 
 tm_shape(crashes_geom) + tm_dots()
 
+
+
 ```
 
 
@@ -171,7 +173,7 @@ st_geometry(df_roads) <- cong_geom$geometry
 sparse <- sparse.model.matrix(combined_score ~ TRAFFICWAY_TYPE + DEVICE_CONDITION + dist_to_closest_light, data = df_roads)
 
 
-tm_shape(df_roads) + tm_lines("y_hat")
+tm_shape(df_roads) + tm_lines("y_hat_rf")
 
 
 ```
@@ -242,6 +244,10 @@ tunedTree <- setHyperPars(tree, par.vals = tunedTreePars$x)
 tunedTreeModel <- train(tunedTree, task)
 
 df_roads$y_hat <- predict(treeModelData, df_roads)
+df_roads$y_hat_RF <- crashesrfmap$predictions$values
+df_roads_drop <- df_roads |> st_drop_geometry()
+df_roads$y_hat_rf <- predict(crashesRF, data=crashgeom_spdf)
+crashesRF$ranger.arguments
 ```
 
 
@@ -331,7 +337,6 @@ testboost <- RMSE (pred = pred_boost,
 testboost
 
 
-
 ```
 
 ```{r}
@@ -346,10 +351,34 @@ explainer_Bag1 <- DALEX::explain(
 
 
 ```{r}
-vip.5_Bag1 <- model_parts(explainer = explainer_Bag1, 
+vip.5_Bag1 <- DALEX::model_parts(explainer = explainer_Bag1, 
                    loss_function = loss_root_mean_square,
                                B = 5, #number of permutation.
                             type = "difference") 
+
+```
+```{r}
+library(caret)
+inTraining <- createDataPartition(cr_hyp$combined_score, p = .75, list = FALSE)
+training <- cr_hyp[ inTraining,]
+testing  <- cr_hyp[-inTraining,]
+
+gbmGrid <-  expand.grid(interaction.depth = c(1, 5, 9), 
+                        n.trees = (1:30)*50, 
+                        shrinkage = 0.1,
+                        n.minobsinnode = 20)
+                        
+nrow(gbmGrid)
+
+set.seed(825)
+gbmFit2 <- caret::train(form, data = training, 
+                 method = "gbm", 
+                 trControl = fitControl, 
+                 verbose = FALSE, 
+                 ## Now specify the exact models 
+                 ## to evaluate:
+                 tuneGrid = gbmGrid)
+gbmFit2
 ```
 
 ```{r}
