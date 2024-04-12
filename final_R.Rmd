@@ -137,7 +137,7 @@ for (i in 1:nrow(cong_geom)){
 #show road map
 #tmap_mode("view")
 
-#tm_shape(cong_geom) + tm_lines()
+tm_shape(cong_geom) + tm_lines()
 
 ```
 
@@ -158,7 +158,7 @@ st_geometry(df_roads) <- cong_geom$geometry
 sparse <- sparse.model.matrix(combined_score ~ TRAFFICWAY_TYPE + DEVICE_CONDITION + dist_to_closest_light, data = df_roads)
 
 
-tm_shape(df_roads) + tm_lines("y_hat_RF", breaks = c(0,0.25,0.5,0.75,1.0,1.25,+Inf) )
+tm_shape(df_roads) + tm_lines("y_hat_RF", lwd=3, breaks = c(0,0.33,0.66,1,1.33,1.66,2,2.33,2.66,3,+Inf) )
 
 ```
 
@@ -180,6 +180,8 @@ sparse <- sparse.model.matrix(combined_score ~ TRAFFICWAY_TYPE + DEVICE_CONDITIO
 
 
 tm_shape(df_roads) + tm_lines("y_hat_RF", breaks = c(0,0.25,0.5,0.75,1.0,1.25,+Inf) )
+
+
 
 
 ```
@@ -236,8 +238,30 @@ library(mlr)
 
 
 ```{r}
+df_roads_alt <- func(df_roads)
+func <- function(df) {
+  df$TRAFFICWAY_TYPE <- factor(df$TRAFFICWAY_TYPE, levels = unique(df$TRAFFICWAY_TYPE))
+  df$TRAFFICWAY_TYPE_numeric <- as.numeric(df$TRAFFICWAY_TYPE)
+  df <- df %>%
+  mutate(device_functioning_numeric = case_when(
+    DEVICE_CONDITION == "NO CONTROLS" ~ 1,
+    DEVICE_CONDITION == "FUNCTIONING PROPERLY" ~ 2,
+    DEVICE_CONDITION == "UNKNOWN" ~ 3,
+    DEVICE_CONDITION == "OTHER" ~ 4,
+    DEVICE_CONDITION == "FUNCTIONING IMPROPERLY" ~ 5,
+    DEVICE_CONDITION == "NOT FUNCTIONING" ~ 6,
+    DEVICE_CONDITION == "WORN REFLECTIVE MATERIAL" ~ 7,
+    DEVICE_CONDITION == "MISSING" ~ 8,
+    TRUE ~ NA_integer_  # Default value if none of the conditions match
+  ))
 
+  return(df)
+}
+df_roads_alt$ROADWAY_SURFACE_COND[df_roads_alt$ROADWAY_SURFACE_COND=='OTHER'] <- 'UNKNOWN'
+predict_DF <- predict(DT1_pruned, df_roads_alt)
+df_roads$y_hat_DT <- predict_RF
 ```
+
 
 
 
@@ -417,7 +441,43 @@ crashesRF
 ```
 ```{r}
 # rsme 0.1542 , normalised rsme 0.3084
+
+distance_matrix <- st_distance(df_roads_alt, df_roads_alt)
+class(distance_matrix) <- setdiff(class(distance_matrix), "units")
+distance_matrix <- as.data.frame(distance_matrix)
+names(distance_matrix) <- 1:ncol(distance_matrix)
+distance_matrix <- as.matrix(distance_matrix)
+
+
+#distance thresholds (same units as distance_matrix)
+distance.thresholds <- c(0, 100, 300, 500) #these thresholds indicates when we are considering spatial pattern how far we look for neighborhoods, in this case we are going up to 500 m
+
+#drop the geometry column from the main sf object so it does not cause issues with the spatialRF functions
+crashgeom_spdf <- df_roads_alt %>% st_drop_geometry()
+crashesRF_roads <- spatialRF::rf_spatial(
+  data =crashgeom_spdf,
+  dependent.variable.name = "combined_score",
+  predictor.variable.names = c("dist_to_closest_light" , "centroid_dist" , "device_functioning_numeric"),
+  distance.matrix = distance_matrix,
+  distance.thresholds = 0, #0
+  method = "mem.moran.sequential", #default method
+  ranger.arguments = list( 
+    mtry = 3,
+    min.node.size = 5,
+    num.trees = 500
+  ),
+  verbose = FALSE,
+  seed = 123
+  )
+
+df_roads$y_hat_RF <- crashesRF_roads$predictions$values
+
+tm_shape(df_roads) + tm_lines("y_hat_RF", lwd=3, breaks = c(0,0.33,0.66,1,1.33,1.66,2,2.33,2.66,3,+Inf) )
+
 ```
+
+
+
 
 
 ```{r}
@@ -427,6 +487,7 @@ p1 <- spatialRF::plot_importance(
   verbose = FALSE
 ) + 
   ggplot2::ggtitle("Spatial RF model")
+p1
 ```
 
 
@@ -452,21 +513,7 @@ p1
 ```{r}
 
 #didnt work
-easypackages::packages ("caret")
-crashesRF_tuned <- rf_tuning(
-  model = crashesRF,
-  xy = xy, #location indicating coordinates of each neighborhood 
-  repetitions = 5, #times the tuning process will run, such as K fold CV, here 5 means we used 5 folds
-  num.trees = c(100, 1000), #the range within which the number of trees the model can select
-  mtry = seq(
-    2,
-    length(crashesRF$ranger.arguments$predictor.variable.names), #number of predictors
-    by = 9),
-  min.node.size = c(5, 15), #minimum rows the model can pick between 5 to 15
-  seed = random.seed,
-  n.cores = 6, #used for faster calculation, check how many cores your laptop has before selecting the core numbers
-  verbose = FALSE
-)
+
 
 
 ```
