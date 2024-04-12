@@ -1,0 +1,515 @@
+---
+title: "Untitled"
+author: "niko"
+date: "2024-03-21"
+output: pdf_document
+---
+
+```{r}
+library(parallel)
+```
+
+```{r}
+library(DALEX)
+library(ipred)
+```
+
+```{r}
+library(sf)
+library(xgboost)
+library(caret)
+library(tmap)
+library(rpart.plot)
+library(dplyr)
+library(lme4)
+library(tidyverse)
+library(geotools)
+library(readr)
+library(mlr)
+#install.packages('mlr')
+#install.packages("parallelMap")
+#install.packages("vip")
+library(parallelMap)
+library(FNN)
+
+```
+
+```{r}
+df <- read_csv("df_10000.csv")
+df <- df |> drop_na(TRAFFICWAY_TYPE)
+df <- df |> drop_na(combined_score)
+df <- df[!(df$LONGITUDE == 0 | df$LATITUDE == 0),]
+```
+
+```{r}
+speed_camera_locations <- read.csv("data/speed-camera-locations.csv")
+congestion <- read.csv("data/congestion.csv")
+
+
+```
+
+```{r}
+
+
+crashes_geom = st_as_sf(df, coords=c("LONGITUDE", "LATITUDE"))
+camera_geom = st_as_sf(speed_camera_locations, coords=c("LONGITUDE", "LATITUDE"))
+
+tmap_mode("view")
+
+#tm_shape(crashes_geom) + tm_dots()
+
+
+```
+
+```         
+```
+
+```         
+```
+
+## distance to closest red light camera
+
+```{r}
+
+#now we would write our own function to estimate distance using nearest neighbor algorithm
+#This function take an origin point (from), and a destination point (to), and then use nn function of FNN package to estimate the distance to the nearest (k =1) neighborhood location
+ nn_function <- function(measureFrom,measureTo,k) {
+    measureFrom_Matrix <- as.matrix(measureFrom)
+    measureTo_Matrix <- as.matrix(measureTo)
+    nn <-   
+      get.knnx(measureTo, measureFrom, k)$nn.dist [,k]
+    return(nn)
+  }
+```
+
+```{r}
+
+dist_matrix = st_distance(crashes_geom, camera_geom) #distance for each point to each point
+tr <- dist_matrix==apply(dist_matrix,1, min) #get min
+index_min <- which(tr == TRUE) %% nrow(camera_geom) + 1 #find min
+crashes_geom$CLOSEST_LIGHT <- camera_geom$geometry[index_min] #project min
+
+crashes_geom$dist_to_closest_light <- mapply(st_distance, crashes_geom$geometry, crashes_geom$CLOSEST_LIGHT)
+crashes_geom <- crashes_geom[crashes_geom$dist_to_closest_light < 50,]
+
+```
+
+```{r}
+crashes_geom$CLOSEST_LIGHT <- camera_geom$geometry[index_min] #project min
+
+crashes_geom$dist_to_closest_light <- mapply(st_distance, crashes_geom$geometry, crashes_geom$CLOSEST_LIGHT)
+crashes_geom <- crashes_geom[crashes_geom$dist_to_closest_light < 50,]
+
+```
+
+```         
+```
+
+```{r}
+chicago_boundaries <- st_read("data/chicago_boundaries.gpkg")    # Selecting only the "communities" and "geom" columns
+chicago_boundaries <- chicago_boundaries[, c("community", "geom")]         # Renaming the "communities" column to "id"
+names(chicago_boundaries)[names(chicago_boundaries) == "community"] <- "id" 
+district_cen <- st_centroid(chicago_boundaries)    
+district_cen <- district_cen |> drop_na(geom)     
+nn_function <- function(measureFrom,measureTo,k) {
+    measureFrom_Matrix <- as.matrix(measureFrom)
+    measureTo_Matrix <- as.matrix(measureTo)
+    nn <-   
+      get.knnx(measureTo, measureFrom, k)$nn.dist [,k]
+    return(nn)
+}     #replace df_clean w what you have df_clean <- df_clean %>%
+
+crashes_geom <- crashes_geom |> mutate(centroid_dist = nn_function(st_coordinates(crashes_geom$geometry), st_coordinates(district_cen$geom), k = 1))
+
+```
+
+## getting geom for roads
+
+```{r}
+cong_geom = st_as_sf(congestion, coords=c("START_LONGITUDE", "START_LATITUDE")) 
+data_sf <- st_as_sf(congestion, coords = c("END_LONGITUDE", "END_LATITUDE"))
+cong_geom$new_l <- st_geometry(data_sf)
+
+for (i in 1:nrow(cong_geom)){
+  result <- st_linestring(rbind(st_coordinates(cong_geom$geometry[i]), st_coordinates(data_sf$geometry[i])))
+  cong_geom$geometry[i] <- result
+}
+#show road map
+#tmap_mode("view")
+
+#tm_shape(cong_geom) + tm_lines()
+
+```
+
+## assigning closest crashes's attributes to each road in the dataset so
+
+```{r}
+dist_matrix2 <- st_distance(cong_geom, crashes_geom) # distance for each point to each point
+tr2 <- dist_matrix2 == apply(dist_matrix2, 1, min) # get min
+index_min2 <- vector()
+for (i in 1:nrow(cong_geom)) {
+  result <- which(tr2[i,] == TRUE)[1] %% nrow(cong_geom) + 1
+  index_min2 <- append(index_min2, result)
+}
+
+
+df_roads <- crashes_geom[index_min2,]
+st_geometry(df_roads) <- cong_geom$geometry
+sparse <- sparse.model.matrix(combined_score ~ TRAFFICWAY_TYPE + DEVICE_CONDITION + dist_to_closest_light, data = df_roads)
+
+
+tm_shape(df_roads) + tm_lines("y_hat_RF", breaks = c(0,0.25,0.5,0.75,1.0,1.25,+Inf) )
+
+```
+
+## we can predict
+
+```{r}
+dist_matrix2 <- st_distance(cong_geom, crashes_geom) # distance for each point to each point
+tr2 <- dist_matrix2 == apply(dist_matrix2, 1, min) # get min
+index_min2 <- vector()
+for (i in 1:nrow(cong_geom)) {
+  result <- which(tr2[i,] == TRUE)[1] %% nrow(cong_geom) + 1
+  index_min2 <- append(index_min2, result)
+}
+
+
+df_roads <- crashes_geom[index_min2,]
+st_geometry(df_roads) <- cong_geom$geometry
+sparse <- sparse.model.matrix(combined_score ~ TRAFFICWAY_TYPE + DEVICE_CONDITION + dist_to_closest_light, data = df_roads)
+
+
+tm_shape(df_roads) + tm_lines("y_hat_RF", breaks = c(0,0.25,0.5,0.75,1.0,1.25,+Inf) )
+
+
+```
+
+```{r}
+library(FNN)
+
+###delete after here
+```
+
+```{r}
+#dealing with NA
+# Count the number of NA values for each column in cr_hyp
+
+
+# Drop rows with NA values in 'combined_score' column using na.omit()
+cr_hyp <- na.omit(cr_hyp)
+na_count <- colSums(is.na(cr_hyp))
+print(na_count)
+```
+
+```{r}
+library(caret)
+library(parallel)
+```
+
+```{r}
+library(mlr)
+```
+
+```         
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+
+```
+
+```{r}
+
+```
+
+
+
+
+
+```{r}
+
+```
+
+
+
+
+
+
+```{r}
+
+#repeat decsion trees
+```
+
+```{r}
+
+#convert trafficway type as numeric 
+# Convert "TRAFFICWAY_TYPE" to a factor
+crashes_geom$TRAFFICWAY_TYPE <- factor(crashes_geom$TRAFFICWAY_TYPE, levels = unique(crashes_geom$TRAFFICWAY_TYPE))
+
+# Convert the factor to numeric
+crashes_geom$TRAFFICWAY_TYPE_numeric <- as.numeric(crashes_geom$TRAFFICWAY_TYPE)
+
+# Display unique numeric values
+```
+
+
+```{r}
+#convert device conditon as numeric
+# Convert "DEVICE_CONDITION" to a factor
+# Define a new column based on DEVICE_CONDITION
+crashes_geom <- crashes_geom %>%
+  mutate(device_functioning_numeric = case_when(
+    DEVICE_CONDITION == "NO CONTROLS" ~ 1,
+    DEVICE_CONDITION == "FUNCTIONING PROPERLY" ~ 2,
+    DEVICE_CONDITION == "UNKNOWN" ~ 3,
+    DEVICE_CONDITION == "OTHER" ~ 4,
+    DEVICE_CONDITION == "FUNCTIONING IMPROPERLY" ~ 5,
+    DEVICE_CONDITION == "NOT FUNCTIONING" ~ 6,
+    DEVICE_CONDITION == "WORN REFLECTIVE MATERIAL" ~ 7,
+    DEVICE_CONDITION == "MISSING" ~ 8,
+    TRUE ~ NA_integer_  # Default value if none of the conditions match
+  ))
+```
+
+
+```{r}
+crashes_geom$device_functioning_numeric
+```
+
+```{r}
+form <- combined_score ~  TRAFFICWAY_TYPE + dist_to_closest_light +  Time_Category + centroid_dist + ROADWAY_SURFACE_COND + CRASH_DAY_OF_WEEK + WEATHER_CONDITION +   INTERSECTION_RELATED_I + device_functioning_numeric + TRAFFICWAY_TYPE_numeric
+
+```
+
+```{r}
+#define crashes_geom
+```
+
+```{r}
+cr_hyp <- crashes_geom
+cr_hyp <- na.omit(cr_hyp)
+
+#split the data into a train/test split
+# Split data into training and testing sets
+set.seed(123)  # for reproducibility
+data_split <- rsample::initial_split(cr_hyp, strata = "combined_score", prop = 0.75) #where we are splitting the data at 75-25, and stratifying based on dependent variable 
+train.set_wtID <- rsample::training(data_split)
+test.set_wtID  <- rsample::testing(data_split)
+
+#declare the set explicit
+train.set <- train.set_wtID 
+test.set <- test.set_wtID
+
+
+
+#Fit the decision tree 
+#Note: We are using, method = "anova". It can also be  "poisson", "class" or "exp". Depending on the data type. In this case mortality rate is a continuous data so we selected anova 
+DT0 <- rpart (form, data= train.set,  method  = "anova") 
+```
+
+```{r}
+rpart.plot(DT0)
+```
+
+```{r}
+
+```
+
+```{r}
+#plot the complexity parameter
+plotcp(DT0)
+```
+
+```         
+```
+
+```{r}
+DT1_pruned <- rpart::prune (DT0, cp = 0.037) # 0.037 based on graph
+
+rpart.plot(DT1_pruned, box.palette = "auto")
+```
+
+```{r}
+#use the predict function to predict the mortality rate based on the trained model 
+
+pred_DT <- predict(object = DT1_pruned, #here you can change the models (e.g., DT0, DT1, DT1_pruned) to see how other models are doing on the test set
+                newdata = test.set)
+
+#check the RMSE value for the predicted set
+testRMSE <- RMSE (pred = pred_DT,
+   obs = test.set$combined_score)
+testRMSE
+```
+
+```{r}
+library(vip)
+p4 <- vip(DT1_pruned, num_features = 19, aesthetics = list(fill = "black"), include_type = TRUE, main = "Title of Your Graph")
+p4
+ 
+```
+
+```{r}
+#make crashgeom_spdf
+#We need an unique ID and coordinates for evaluating the spatial correlations
+crashes_geom$id <- 1:nrow(crashes_geom) #this is to give an unique ID to each row
+crashes_geom$x <- st_coordinates(crashes_geom)[, 1] #get the X coordinate of the point
+crashes_geom$y <- st_coordinates(crashes_geom)[, 2] #get the Y coordinate of the point
+
+
+#now convert the file into a SP object, as the gDistance function we are using from rgeos package can only work on SP object
+crashgeom_sp <- as_Spatial(crashes_geom)
+
+#calculate the distance matrix based on sp object
+#distance_matrix <- gDistance(greendatacen_sp, byid=TRUE) #this is no longer working!
+
+#Calculate the distance matrix based on sf object
+distance_matrix <- st_distance(crashes_geom, crashes_geom)
+class(distance_matrix) <- setdiff(class(distance_matrix), "units")
+distance_matrix <- as.data.frame(distance_matrix)
+names(distance_matrix) <- 1:ncol(distance_matrix)
+distance_matrix <- as.matrix(distance_matrix)
+
+
+#distance thresholds (same units as distance_matrix)
+distance.thresholds <- c(0, 100, 300, 500) #these thresholds indicates when we are considering spatial pattern how far we look for neighborhoods, in this case we are going up to 500 m
+
+#drop the geometry column from the main sf object so it does not cause issues with the spatialRF functions
+crashgeom_spdf <- crashes_geom %>% st_drop_geometry()
+```
+
+
+```{r}
+xy <- crashgeom_spdf[, c("x", "y")]
+```
+
+```{r}
+# Spatial RF
+random.seed <- 123
+crashesRF <- spatialRF::rf_spatial(
+  data =crashgeom_spdf,
+  dependent.variable.name = "combined_score",
+  predictor.variable.names = c("TRAFFICWAY_TYPE" , "dist_to_closest_light" ,  "Time_Category" , "centroid_dist" , "ROADWAY_SURFACE_COND" , "CRASH_DAY_OF_WEEK" , "WEATHER_CONDITION" , "device_functioning_numeric"),
+  distance.matrix = distance_matrix,
+  distance.thresholds = 0, #0
+  method = "mem.moran.sequential", #default method
+  ranger.arguments = list( 
+    mtry = 3,
+    min.node.size = 5,
+    num.trees = 500
+  ),
+  verbose = FALSE,
+  seed = random.seed
+  )
+```
+
+```{r}
+#print the model result
+crashesRF
+```
+```{r}
+# rsme 0.1542 , normalised rsme 0.3084
+```
+
+
+```{r}
+#Plot the VIP
+p1 <- spatialRF::plot_importance(
+  crashesRF,
+  verbose = FALSE
+) + 
+  ggplot2::ggtitle("Spatial RF model")
+```
+
+
+```{r}
+p3 <- vip(crashesRF, num_features = 19, aesthetics = list(fill = "black"), include_type = TRUE, main = "Title of Your Graph")
+
+p3
+```
+
+
+```{r}
+#Plot the VIP
+p1 <- spatialRF::plot_importance(
+  crashesRF,
+  verbose = FALSE
+) + 
+  ggplot2::ggtitle("Spatial RF model") 
+
+p1
+```
+
+
+```{r}
+
+#didnt work
+easypackages::packages ("caret")
+crashesRF_tuned <- rf_tuning(
+  model = crashesRF,
+  xy = xy, #location indicating coordinates of each neighborhood 
+  repetitions = 5, #times the tuning process will run, such as K fold CV, here 5 means we used 5 folds
+  num.trees = c(100, 1000), #the range within which the number of trees the model can select
+  mtry = seq(
+    2,
+    length(crashesRF$ranger.arguments$predictor.variable.names), #number of predictors
+    by = 9),
+  min.node.size = c(5, 15), #minimum rows the model can pick between 5 to 15
+  seed = random.seed,
+  n.cores = 6, #used for faster calculation, check how many cores your laptop has before selecting the core numbers
+  verbose = FALSE
+)
+
+
+```
+
+
+```{r}
+
+VIPrep <- spatialRF::plot_importance(
+  crashesRF, 
+  verbose = FALSE
+  )
+
+VIPrep
+```
+
+```{r}
+
+ explainer_RF1 <- DALEX::explain(
+  model = crashesRF,
+  data = crashgeom_spdf,
+  y = as.integer (crashgeom_spdf$combined_score),
+  label = " Spatial RF",
+  verbose = FALSE
+)
+
+
+#Also plot pdp
+pdp_RF1 <- model_profile(explainer = explainer_RF1, variables = "centroid_dist")
+
+# Plot PDP with title and custom theme
+plot(pdp_RF1, geom = "profiles") +
+  labs(title = "Partial Dependence Profile for Crash Severity Score Using Centroid Distance for Spatial RF Model") +
+  theme_minimal() +  # Minimal theme as a base
+  theme(text = element_text(family = "Times New Roman", color = "black")) 
+```
+
+
+
+```{r}
+crashesRF$ranger.arguments$data
+```
+
+
+
+
+
